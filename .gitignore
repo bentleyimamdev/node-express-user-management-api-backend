@@ -4,3 +4,7 @@ npm-debug.log*
 
 # Local database backups
 backups/
+
+# Local backup files
+*.backup-*
+*.before-*
