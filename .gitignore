@@ -8,3 +8,6 @@ backups/
 # Local backup files
 *.backup-*
 *.before-*
+
+y
+y.pub
