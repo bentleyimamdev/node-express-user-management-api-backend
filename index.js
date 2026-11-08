@@ -37,7 +37,7 @@ app.use(express.json());
 
 // ==================== GET ====================
 
-app.get("/api/v1/users", verifyToken, async (req, res) => {
+app.get("/api/v1/users", verifyToken, verifyAdmin, async (req, res) => {
     try {
 
 
@@ -45,7 +45,9 @@ app.get("/api/v1/users", verifyToken, async (req, res) => {
 
 
 
-        const [rows] = await db.query("SELECT * FROM users");
+        const [rows] = await db.query(
+            "SELECT id, name, kategori, email, role FROM users"
+        );
         res.json(rows);
     } catch (err) {
         console.error(err);
@@ -58,7 +60,7 @@ app.get("/api/v1/users", verifyToken, async (req, res) => {
 app.post("/api/v1/users", verifyToken, verifyAdmin, async (req, res) => {
     try {
         const { name, kategori, email, password, role } = req.body;
-        console.log("DATA CREATE USER =", req.body);
+
         const hashedPassword = await bcrypt.hash(password, 10);
 
         const [result] = await db.query(
@@ -722,6 +724,18 @@ app.get("/api/v1/products/best-selling", verifyToken, async (req, res) => {
                 message: "Period tidak valid"
             });
         }
+
+        // Batasi best-selling berdasarkan pemilik transaksi
+        if (req.user.role !== "admin") {
+            dateCondition += dateCondition
+                ? " AND t.user_id = ?"
+                : " WHERE t.user_id = ?";
+
+            queryParams.push(req.user.id);
+        }
+
+
+
         const [rows] = await db.query(`
             SELECT
                 p.id AS product_id,
@@ -875,53 +889,6 @@ app.post("/api/v1/categories", verifyToken, verifyAdmin, async (req, res) => {
         res.status(201).json({
             message: "Kategori berhasil ditambahkan",
             categoryId: result.insertId
-        });
-
-    } catch (err) {
-        console.error(err);
-
-        if (err.code === "ER_DUP_ENTRY") {
-            return res.status(409).json({
-                message: "Kategori sudah ada"
-            });
-        }
-
-        res.status(500).json({
-            message: err.message
-        });
-    }
-});
-
-// ==================== UPDATE CATEGORY ====================
-
-app.put("/api/v1/categories/:id", verifyToken, verifyAdmin, async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { name } = req.body;
-
-        if (!name || !name.trim()) {
-            return res.status(400).json({
-                message: "Nama kategori wajib diisi"
-            });
-        }
-
-        const [result] = await db.query(
-            `
-            UPDATE categories
-            SET name = ?
-            WHERE id = ?
-            `,
-            [name.trim(), id]
-        );
-
-        if (result.affectedRows === 0) {
-            return res.status(404).json({
-                message: "Kategori tidak ditemukan"
-            });
-        }
-
-        res.json({
-            message: "Kategori berhasil diperbarui"
         });
 
     } catch (err) {
@@ -1359,12 +1326,16 @@ app.get("/api/v1/transactions", verifyToken, async (req, res) => {
             )
         ) AS gross_profit
 
-    FROM transactions t
-    INNER JOIN users u
-        ON t.user_id = u.id
-    ORDER BY t.created_at DESC
+FROM transactions t
+INNER JOIN users u
+    ON t.user_id = u.id
+WHERE (? = 'admin' OR t.user_id = ?)
+ORDER BY t.created_at DESC
 
-`);
+
+
+        `, [req.user.role, req.user.id]);
+
 
         res.json(rows);
     } catch (err) {
@@ -1388,6 +1359,12 @@ app.get("/api/v1/reports/sales", verifyToken, async (req, res) => {
 
         let where = [];
         let params = [];
+
+        // Batasi laporan berdasarkan pemilik transaksi
+        if (req.user.role !== "admin") {
+            where.push("t.user_id = ?");
+            params.push(req.user.id);
+        }
 
         // Filter tanggal
         if (date_from || date_to) {
@@ -1629,6 +1606,16 @@ app.get("/api/v1/dashboard/summary", verifyToken, async (req, res) => {
             return res.status(400).json({
                 message: "Period tidak valid"
             });
+
+        }
+
+        // Batasi dashboard berdasarkan pemilik transaksi
+        if (req.user.role !== "admin") {
+            dateCondition += dateCondition
+                ? " AND t.user_id = ?"
+                : " WHERE t.user_id = ?";
+
+            queryParams.push(req.user.id);
         }
         const [rows] = await db.query(`
             SELECT
@@ -1672,7 +1659,13 @@ app.get("/api/v1/dashboard/sales-chart", verifyToken, async (req, res) => {
         // ==================== TENTUKAN RENTANG ====================
 
         if (period === "all") {
-            startDate = "(SELECT COALESCE(MIN(DATE(created_at)), CURDATE()) FROM transactions)";
+            if (req.user.role === "admin") {
+                startDate = "(SELECT COALESCE(MIN(DATE(created_at)), CURDATE()) FROM transactions)";
+            } else {
+                startDate = "(SELECT COALESCE(MIN(DATE(created_at)), CURDATE()) FROM transactions WHERE user_id = ?)";
+                params.push(req.user.id);
+            }
+
             endDate = "CURDATE()";
 
         } else if (period === "today") {
@@ -1717,7 +1710,15 @@ app.get("/api/v1/dashboard/sales-chart", verifyToken, async (req, res) => {
             return res.status(400).json({
                 message: "Period tidak valid"
             });
+
+
+
         }
+
+        params.push(req.user.role, req.user.id);
+
+
+
 
         // ==================== DATE SERIES ====================
 
@@ -1743,6 +1744,7 @@ app.get("/api/v1/dashboard/sales-chart", verifyToken, async (req, res) => {
             FROM dates
             LEFT JOIN transactions t
                 ON DATE(t.created_at) = dates.date
+                AND (? = 'admin' OR t.user_id = ?)
             GROUP BY dates.date
             ORDER BY dates.date ASC
         `, params);
@@ -1785,8 +1787,9 @@ app.get("/api/v1/transactions/:id", verifyToken, async (req, res) => {
             INNER JOIN users u
                 ON t.user_id = u.id
             WHERE t.id = ?
-            `,
-            [id]
+AND (? = 'admin' OR t.user_id = ?)
+`,
+            [id, req.user.role, req.user.id]
         );
 
         if (transactions.length === 0) {
