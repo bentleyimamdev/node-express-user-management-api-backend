@@ -23,7 +23,7 @@ const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-
+const crypto = require("crypto");
 
 const app = express();
 
@@ -61,15 +61,28 @@ app.post("/api/v1/users", verifyToken, verifyAdmin, async (req, res) => {
     try {
         const { name, kategori, email, password, role } = req.body;
 
+        const allowedRoles = ["admin", "staff", "user"];
+
+        if (
+            typeof name !== "string" ||
+            !name.trim() ||
+            typeof email !== "string" ||
+            !email.trim() ||
+            typeof password !== "string" ||
+            password.trim().length < 6 ||
+            !allowedRoles.includes(role)
+        ) {
+            return res.status(400).json({
+                message: "Data user tidak valid. Password minimal 6 karakter dan role harus valid.",
+            });
+        }
+
         const hashedPassword = await bcrypt.hash(password, 10);
 
-        const [result] = await db.query(
+        await db.query(
             "INSERT INTO users (name,kategori,email,password,role) VALUES (?,?,?,?,?)",
             [name, kategori, email, hashedPassword, role]
         );
-
-        console.log("INSERT RESULT =", result);
-        console.log("KATEGORI YANG DISIMPAN =", kategori);
 
         await logActivity(
             req.user.id,
@@ -79,39 +92,97 @@ app.post("/api/v1/users", verifyToken, verifyAdmin, async (req, res) => {
             `Menambahkan user ${name} (${email})`
         );
 
-
-
-        res.json({
+        return res.status(201).json({
             message: "User berhasil ditambahkan",
         });
 
     } catch (err) {
         console.error(err);
 
-        res.status(500).json({
-            message: err.message,
-            code: err.code,
+        if (err.code === "ER_DUP_ENTRY") {
+            return res.status(409).json({
+                message: "Email sudah digunakan",
+            });
+        }
+
+        return res.status(500).json({
+            message: "Terjadi kesalahan pada server",
         });
     }
 });
 
 // ==================== PUT ====================
+
 app.put("/api/v1/users/:id", verifyToken, verifyAdmin, async (req, res) => {
     try {
         const { id } = req.params;
-        const { name, kategori,email, password, role } = req.body;
+        const { name, kategori, email, password, role } = req.body;
+        const allowedRoles = ["admin", "staff", "user"];
 
-        let hashedPassword = password;
-
-        if (password && !password.startsWith("$2")) {
-            hashedPassword = await bcrypt.hash(password, 10);
+        if (
+            typeof name !== "string" ||
+            !name.trim() ||
+            typeof email !== "string" ||
+            !email.trim() ||
+            !allowedRoles.includes(role)
+        ) {
+            return res.status(400).json({
+                message: "Data user tidak valid",
+            });
         }
-        await db.query(
-            "UPDATE users SET name=?, kategori=?,email=?, password=?, role=? WHERE id=?",
-            [name, kategori, email, hashedPassword, role, id]
+        let query = `
+            UPDATE users
+            SET name = ?, kategori = ?, email = ?, role = ?
+        `;
+
+        const values = [name, kategori, email, role];
+
+        const [existingUser] = await db.query(
+            "SELECT id, role FROM users WHERE id = ?",
+            [id]
         );
 
 
+
+
+            if (existingUser.length === 0) {
+                return res.status(404).json({
+                    message: "User tidak ditemukan",
+                });
+            }
+
+            const hasNewPassword =
+                password !== undefined &&
+                password !== null &&
+                password !== "";
+
+            const roleChanged = existingUser[0].role !== role;
+        // Password hanya diperbarui jika admin mengisi password baru
+        if (hasNewPassword) {
+
+            if (
+                typeof password !== "string" ||
+                password.trim().length < 6
+            ) {
+                return res.status(400).json({
+                    message: "Password baru minimal 6 karakter",
+                });
+            }
+
+            const hashedPassword = await bcrypt.hash(password, 10);
+            query += ", password = ?";
+            values.push(hashedPassword);
+        }
+
+        // CABUT SESI LAMA
+        if (roleChanged || hasNewPassword) {
+            query += ", refresh_token = NULL";
+        }
+
+        query += " WHERE id = ?";
+        values.push(id);
+
+        await db.query(query, values);
 
         await logActivity(
             req.user.id,
@@ -124,13 +195,23 @@ app.put("/api/v1/users/:id", verifyToken, verifyAdmin, async (req, res) => {
 
 
 
+
         res.json({
             message: "User berhasil diupdate",
         });
 
     } catch (err) {
         console.error(err);
-        res.status(500).json(err);
+
+        if (err.code === "ER_DUP_ENTRY") {
+            return res.status(409).json({
+                message: "Email sudah digunakan",
+            });
+        }
+
+        res.status(500).json({
+            message: err.message,
+        });
     }
 });
 
@@ -141,12 +222,16 @@ app.put("/api/v1/change-password", verifyToken, async (req, res) => {
     try {
         const { oldPassword, newPassword } = req.body;
 
-        if (!oldPassword || !newPassword) {
+        if (
+            typeof oldPassword !== "string" ||
+            oldPassword.length === 0 ||
+            typeof newPassword !== "string" ||
+            newPassword.trim().length < 6
+        ) {
             return res.status(400).json({
-                message: "Password lama dan password baru harus diisi",
+                message: "Password lama harus diisi dan password baru minimal 6 karakter",
             });
         }
-
         const [rows] = await db.query(
             "SELECT password FROM users WHERE id=?",
             [req.user.id]
@@ -172,7 +257,7 @@ app.put("/api/v1/change-password", verifyToken, async (req, res) => {
         const hash = await bcrypt.hash(newPassword, 10);
 
         await db.query(
-            "UPDATE users SET password=? WHERE id=?",
+            "UPDATE users SET password=?, refresh_token=NULL WHERE id=?",
             [hash, req.user.id]
         );
 
@@ -196,9 +281,6 @@ app.put("/api/v1/change-password", verifyToken, async (req, res) => {
     }
 });
 // ==================== ACTIVITY LOG ====================
-
-
-
 async function logActivity(
     userId,
     name,
@@ -208,27 +290,17 @@ async function logActivity(
     transactionCode = null
 ) {
     try {
-
-        console.log("LOG ACTIVITY:", {
-            userId,
-            name,
-            email,
-            action,
-            description,
-            transactionCode,
-        });
-
         await db.query(
             "INSERT INTO activity_logs (user_id,name,email,action,transaction_code,description) VALUES (?,?,?,?,?,?)",
             [userId, name, email, action, transactionCode, description]
         );
 
-        console.log("Activity berhasil disimpan");
-
     } catch (err) {
         console.error("Activity Log Error:", err);
     }
 }
+
+
 
 // ==================== DELETE ====================
 
@@ -285,7 +357,9 @@ app.post("/api/v1/login", async (req, res) => {
         const { email, password } = req.body;
 
         const [rows] = await db.query(
-            "SELECT * FROM users WHERE email=?",
+            `SELECT id, name, kategori, email, role, password, is_active
+     FROM users
+     WHERE email = ?`,
             [email]
         );
 
@@ -296,6 +370,14 @@ app.post("/api/v1/login", async (req, res) => {
         }
 
         const user = rows[0];
+
+
+
+        if (Number(user.is_active) !== 1) {
+            return res.status(401).json({
+                message: "Email atau password salah",
+            });
+        }
 
         const cocok = await bcrypt.compare(
             password,
@@ -308,6 +390,8 @@ app.post("/api/v1/login", async (req, res) => {
             });
         }
 
+        const sessionId = crypto.randomUUID();
+
         const refreshToken = jwt.sign(
             {
                 id: user.id,
@@ -315,7 +399,13 @@ app.post("/api/v1/login", async (req, res) => {
             JWT_REFRESH_SECRET,
             {
                 expiresIn: "7d",
+                jwtid: sessionId,
             }
+        );
+
+        await db.query(
+            "UPDATE users SET refresh_token = ? WHERE id = ?",
+            [sessionId, user.id]
         );
 
         const token = jwt.sign(
@@ -324,12 +414,14 @@ app.post("/api/v1/login", async (req, res) => {
                 name: user.name,
                 email: user.email,
                 role: user.role,
+                sid: sessionId,
             },
             JWT_SECRET,
             {
                 expiresIn: "1d",
             }
         );
+
 
         await logActivity(
             user.id,
@@ -338,8 +430,14 @@ app.post("/api/v1/login", async (req, res) => {
             "LOGIN",
             `${user.email} berhasil login`
         );
-        const safeUser = { ...user };
-        delete safeUser.password;
+        const safeUser = {
+            id: user.id,
+            name: user.name,
+            kategori: user.kategori,
+            email: user.email,
+            role: user.role,
+
+        };
         res.json({
             message: "Login berhasil",
             token,
@@ -375,7 +473,9 @@ app.post("/api/v1/refresh", async (req, res) => {
         );
 
         const [rows] = await db.query(
-            "SELECT id, name, email, role FROM users WHERE id=?",
+            `SELECT id, name, email, role, is_active, refresh_token
+     FROM users
+     WHERE id = ?`,
             [decoded.id]
         );
 
@@ -387,12 +487,23 @@ app.post("/api/v1/refresh", async (req, res) => {
 
         const user = rows[0];
 
+        if (
+            Number(user.is_active) !== 1 ||
+            !decoded.jti ||
+            user.refresh_token !== decoded.jti
+        ) {
+            return res.status(401).json({
+                message: "Sesi tidak valid",
+            });
+        }
+
         const token = jwt.sign(
             {
                 id: user.id,
                 name: user.name,
                 email: user.email,
                 role: user.role,
+                sid: decoded.jti
             },
             JWT_SECRET,
             {
@@ -400,9 +511,18 @@ app.post("/api/v1/refresh", async (req, res) => {
             }
         );
 
-        res.json({
+        const safeUser = {
+            id: user.id,
+            name: user.name,
+            email: user.email,
+            role: user.role,
+        };
+
+        return res.json({
             accessToken: token,
+            user: safeUser,
         });
+
 
     } catch (err) {
         if (err.name === "TokenExpiredError") {
@@ -423,7 +543,18 @@ app.post("/api/v1/refresh", async (req, res) => {
 
 app.post("/api/v1/logout", verifyToken, async (req, res) => {
     try {
+        const [result] = await db.query(
+            `UPDATE users
+     SET refresh_token = NULL
+     WHERE id = ? AND refresh_token = ?`,
+            [req.user.id, req.user.sid]
+        );
 
+        if (result.affectedRows === 0) {
+            return res.status(401).json({
+                message: "Sesi tidak valid",
+            });
+        }
         await logActivity(
             req.user.id,
             req.user.name,
@@ -458,6 +589,9 @@ app.get("/api/v1/activity-logs", verifyToken, verifyAdmin, async (req, res) => {
 
         res.json(rows);
 
+
+
+
     } catch (err) {
         console.error(err);
 
@@ -491,7 +625,12 @@ app.get("/api/v1/products", verifyToken, async (req, res) => {
             ORDER BY p.id DESC
         `);
 
-        res.json(rows);
+        const products =
+            req.user.role === "admin"
+                ? rows
+                : rows.map(({ purchase_price, ...product }) => product);
+
+        res.json(products);
 
     } catch (err) {
         console.error(err);
@@ -666,7 +805,7 @@ app.delete("/api/v1/products/:id", verifyToken, verifyAdmin, async (req, res) =>
 
 // ==================== GET BEST SELLING PRODUCTS ====================
 
-app.get("/api/v1/products/best-selling", verifyToken, async (req, res) => {
+app.get("/api/v1/products/best-selling", verifyToken, verifyAdmin, async (req, res) => {
     try {
         const {
             period = "all",
@@ -795,7 +934,7 @@ LIMIT 10
 
 // ==================== GET LOW STOCK PRODUCTS ====================
 
-app.get("/api/v1/products/low-stock", verifyToken, async (req, res) => {
+app.get("/api/v1/products/low-stock", verifyToken, verifyAdmin, async (req, res) => {
     try {
         const threshold = Number(req.query.threshold ?? 5);
 
@@ -841,7 +980,7 @@ app.get("/api/v1/products/low-stock", verifyToken, async (req, res) => {
 
 // ==================== GET CATEGORIES ====================
 
-app.get("/api/v1/categories", verifyToken, async (req, res) => {
+app.get("/api/v1/categories", verifyToken, verifyAdmin, async (req, res) => {
     try {
 
         const [rows] = await db.query(`
@@ -992,14 +1131,11 @@ app.delete("/api/v1/categories/:id", verifyToken, verifyAdmin, async (req, res) 
 
 app.post("/api/v1/transactions", verifyToken, async (req, res) => {
 
-    console.log("=== POST TRANSACTIONS MASUK ===");
-    console.log("BODY TRANSAKSI =", req.body);
-    console.log("USER =", req.user);
-    console.log("=== SEBELUM GET CONNECTION ===");
-    const connection = await db.getConnection();
-    console.log("=== GET CONNECTION BERHASIL ===");
+    let connection = null;
+    let transactionStarted = false;
 
     try {
+        connection = await db.getConnection();
         const {
             items,
             discount = 0,
@@ -1022,33 +1158,41 @@ app.post("/api/v1/transactions", verifyToken, async (req, res) => {
             });
         }
         // ==================== VALIDASI ====================
-
         if (!Array.isArray(items) || items.length === 0) {
             return res.status(400).json({
                 message: "Minimal satu produk harus dipilih"
             });
         }
 
-        if (paid_amount === undefined || paid_amount === null) {
+        if (
+            typeof paid_amount !== "number" ||
+            !Number.isFinite(paid_amount) ||
+            paid_amount < 0
+        ) {
             return res.status(400).json({
-                message: "Jumlah pembayaran wajib diisi"
+                message: "Jumlah pembayaran tidak valid"
             });
         }
 
-        if (Number(discount) < 0) {
+        if (
+            typeof discount !== "number" ||
+            !Number.isFinite(discount) ||
+            discount < 0
+        ) {
             return res.status(400).json({
-                message: "Diskon tidak boleh negatif"
+                message: "Diskon tidak valid"
             });
         }
+
 
         // ==================== START TRANSACTION ====================
 
-        console.log("=== SEBELUM BEGIN TRANSACTION ===");
         await connection.beginTransaction();
-        console.log("=== BEGIN TRANSACTION BERHASIL ===");
+        transactionStarted = true;
 
         let subtotal = 0;
         const transactionItems = [];
+        const seenProductIds = new Set();
 
         // ==================== CEK PRODUK & STOK ====================
 
@@ -1056,9 +1200,20 @@ app.post("/api/v1/transactions", verifyToken, async (req, res) => {
             const productId = Number(item.product_id);
             const quantity = Number(item.quantity);
 
-            if (!Number.isInteger(productId) || quantity <= 0) {
+            if (
+                !Number.isInteger(productId) ||
+                !Number.isInteger(quantity) ||
+                quantity <= 0
+            ) {
                 throw new Error("Product ID atau quantity tidak valid");
             }
+            if (seenProductIds.has(productId)) {
+                throw new Error("Produk yang sama tidak boleh dikirim dua kali");
+            }
+
+            seenProductIds.add(productId);
+
+
 
             const [products] = await connection.query(
                 `
@@ -1095,11 +1250,18 @@ app.post("/api/v1/transactions", verifyToken, async (req, res) => {
             const price = Number(product.selling_price);
             const itemSubtotal = price * quantity;
 
-            const itemDiscount = Number(item.discount) || 0;
+            const itemDiscount =
+                item.discount === undefined || item.discount === null
+                    ? 0
+                    : item.discount;
 
-            if (itemDiscount < 0) {
+            if (
+                typeof itemDiscount !== "number" ||
+                !Number.isFinite(itemDiscount) ||
+                itemDiscount < 0
+            ) {
                 throw new Error(
-                    `Diskon produk ${product.name} tidak boleh negatif`
+                    `Diskon produk ${product.name} tidak valid`
                 );
             }
 
@@ -1142,14 +1304,22 @@ const totalHpp = transactionItems.reduce(
             throw new Error("Diskon tidak boleh lebih besar dari subtotal");
         }
 
-        const paidAmount = Number(paid_amount);
+        const paidAmount = paid_amount;
 
         if (paidAmount < grandTotal) {
             throw new Error("Pembayaran kurang");
         }
 
-        const changeAmount = paidAmount - grandTotal;
+        if (payment_method !== "cash" && paidAmount !== grandTotal) {
+            throw new Error(
+                "Pembayaran non-tunai harus sama dengan total transaksi"
+            );
+        }
 
+        const changeAmount =
+            payment_method === "cash"
+                ? paidAmount - grandTotal
+                : 0;
         // ==================== GENERATE CODE ====================
 
         const transactionCode =
@@ -1239,9 +1409,8 @@ const totalHpp = transactionItems.reduce(
         }
 
         // ==================== COMMIT ====================
-        console.log("=== SEBELUM COMMIT ===");
         await connection.commit();
-        console.log("=== COMMIT BERHASIL ===");
+        transactionStarted = false;
 
         await logActivity(
             req.user.id,
@@ -1266,16 +1435,28 @@ const totalHpp = transactionItems.reduce(
 
     } catch (err) {
 
-        await connection.rollback();
+        if (connection && transactionStarted) {
+            try {
+                await connection.rollback();
+            } catch (rollbackErr) {
+                console.error("Transaction Rollback Error:", rollbackErr);
+            }
+        }
 
         console.error(err);
 
-        res.status(400).json({
-            message: err.message
+        const isServerError = !connection || Boolean(err.code);
+
+        return res.status(isServerError ? 500 : 400).json({
+            message: isServerError
+                ? "Terjadi kesalahan pada server"
+                : err.message
         });
 
     } finally {
-        connection.release();
+        if (connection) {
+            connection.release();
+        }
     }
 });
 
@@ -1337,7 +1518,17 @@ ORDER BY t.created_at DESC
         `, [req.user.role, req.user.id]);
 
 
+        if (req.user.role !== "admin") {
+            const safeRows = rows.map(
+                ({ total_hpp, gross_profit, ...transaction }) => transaction
+            );
+
+            return res.json(safeRows);
+        }
+
+
         res.json(rows);
+
     } catch (err) {
         console.error(err);
 
@@ -1348,7 +1539,7 @@ ORDER BY t.created_at DESC
 });
 
 // ==================== GET SALES REPORT ====================
-app.get("/api/v1/reports/sales", verifyToken, async (req, res) => {
+app.get("/api/v1/reports/sales", verifyToken, verifyAdmin, async (req, res) => {
     try {
         const {
             date_from,
@@ -1557,7 +1748,7 @@ app.get("/api/v1/reports/sales", verifyToken, async (req, res) => {
 
 // ==================== GET DASHBOARD SUMMARY ====================
 
-app.get("/api/v1/dashboard/summary", verifyToken, async (req, res) => {
+app.get("/api/v1/dashboard/summary", verifyToken, verifyAdmin, async (req, res) => {
     try {
         const { period = "all", date_from, date_to } = req.query;
 
@@ -1648,7 +1839,7 @@ app.get("/api/v1/dashboard/summary", verifyToken, async (req, res) => {
 
 // ==================== GET SALES CHART ====================
 
-app.get("/api/v1/dashboard/sales-chart", verifyToken, async (req, res) => {
+app.get("/api/v1/dashboard/sales-chart", verifyToken, verifyAdmin, async (req, res) => {
     try {
         const { period = "all", date_from, date_to } = req.query;
 
@@ -1826,10 +2017,19 @@ AND (? = 'admin' OR t.user_id = ?)
             [id]
         );
 
+       const safeItems = req.user.role === "admin"
+    ? items
+    : items.map(
+        ({ cost_price, item_profit, ...item }) => item
+    );
+
         res.json({
             transaction: transactions[0],
-            items
+            items: safeItems
         });
+
+
+
 
     } catch (err) {
         console.error(err);
