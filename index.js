@@ -459,9 +459,9 @@ app.post("/api/v1/login", async (req, res) => {
 
 app.post("/api/v1/refresh", async (req, res) => {
     try {
-        const { refreshToken } = req.body;
+        const refreshToken = req.body?.refreshToken;
 
-        if (!refreshToken) {
+        if (typeof refreshToken !== "string" || !refreshToken.trim()) {
             return res.status(401).json({
                 message: "Refresh token tidak ditemukan",
             });
@@ -472,10 +472,21 @@ app.post("/api/v1/refresh", async (req, res) => {
             JWT_REFRESH_SECRET
         );
 
+        if (
+            !decoded ||
+            typeof decoded !== "object" ||
+            !decoded.id ||
+            !decoded.jti
+        ) {
+            return res.status(401).json({
+                message: "Sesi tidak valid",
+            });
+        }
+
         const [rows] = await db.query(
             `SELECT id, name, email, role, is_active, refresh_token
-     FROM users
-     WHERE id = ?`,
+             FROM users
+             WHERE id = ?`,
             [decoded.id]
         );
 
@@ -489,7 +500,6 @@ app.post("/api/v1/refresh", async (req, res) => {
 
         if (
             Number(user.is_active) !== 1 ||
-            !decoded.jti ||
             user.refresh_token !== decoded.jti
         ) {
             return res.status(401).json({
@@ -503,7 +513,7 @@ app.post("/api/v1/refresh", async (req, res) => {
                 name: user.name,
                 email: user.email,
                 role: user.role,
-                sid: decoded.jti
+                sid: decoded.jti,
             },
             JWT_SECRET,
             {
@@ -523,20 +533,26 @@ app.post("/api/v1/refresh", async (req, res) => {
             user: safeUser,
         });
 
-
     } catch (err) {
-        if (err.name === "TokenExpiredError") {
+        if (
+            err.name === "TokenExpiredError" ||
+            err.name === "JsonWebTokenError" ||
+            err.name === "NotBeforeError"
+        ) {
             return res.status(401).json({
-                message: "Refresh token expired",
+                message: err.name === "TokenExpiredError"
+                    ? "Refresh token expired"
+                    : "Refresh token tidak valid",
             });
         }
 
-        return res.status(401).json({
-            message: "Refresh token tidak valid",
+        console.error("REFRESH TOKEN ERROR:", err);
+
+        return res.status(500).json({
+            message: "Gagal memperbarui sesi",
         });
     }
 });
-
 
 
 // ==================== LOGOUT ====================
